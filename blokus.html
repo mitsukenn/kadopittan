@@ -1,0 +1,1362 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>BLOKUS - 2人対戦ゲーム</title>
+  <link rel="icon" href="aicon.png" type="image/png">
+  <link rel="apple-touch-icon" href="aicon.png">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700;900&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      font-family: 'Noto Sans JP', sans-serif;
+      -webkit-tap-highlight-color: transparent;
+      touch-action: manipulation;
+      overflow-x: hidden;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.6; }
+    }
+    @keyframes bounce {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.05); }
+    }
+    @keyframes slideUp {
+      from { opacity: 0; transform: translateY(20px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes glowPulse {
+      0%, 100% { box-shadow: 0 0 8px 2px currentColor; }
+      50% { box-shadow: 0 0 16px 4px currentColor; }
+    }
+    @keyframes lastPlacedGlow {
+      0%, 100% { box-shadow: inset 2px 2px 4px rgba(255,255,255,0.4), inset -1px -1px 3px rgba(0,0,0,0.2), 0 0 8px 2px rgba(255,255,255,0.6); }
+      50% { box-shadow: inset 2px 2px 4px rgba(255,255,255,0.4), inset -1px -1px 3px rgba(0,0,0,0.2), 0 0 14px 4px rgba(255,255,255,0.8); }
+    }
+    @keyframes boardRotate0 {
+      from { transform: rotate(180deg); }
+      to { transform: rotate(0deg); }
+    }
+    @keyframes boardRotate180 {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(180deg); }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useCallback, useMemo, useEffect, useRef } = React;
+
+    // === Sound Engine (Web Audio API) ===
+    const SoundEngine = (() => {
+      let ctx = null;
+      let muted = false;
+
+      const getCtx = () => {
+        if (!ctx) {
+          ctx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (ctx.state === 'suspended') {
+          ctx.resume();
+        }
+        return ctx;
+      };
+
+      const play = (fn) => {
+        if (muted) return;
+        try { fn(getCtx()); } catch(e) {}
+      };
+
+      return {
+        isMuted: () => muted,
+        setMuted: (v) => { muted = v; },
+
+        // ピース選択: 軽い「ポン」
+        select: () => play((ac) => {
+          const o = ac.createOscillator();
+          const g = ac.createGain();
+          o.type = 'sine';
+          o.frequency.setValueAtTime(660, ac.currentTime);
+          o.frequency.exponentialRampToValueAtTime(880, ac.currentTime + 0.05);
+          g.gain.setValueAtTime(0.15, ac.currentTime);
+          g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.15);
+          o.connect(g).connect(ac.destination);
+          o.start(ac.currentTime);
+          o.stop(ac.currentTime + 0.15);
+        }),
+
+        // 回転/反転: 「シュッ」
+        rotate: () => play((ac) => {
+          const bufSize = ac.sampleRate * 0.08;
+          const buf = ac.createBuffer(1, bufSize, ac.sampleRate);
+          const data = buf.getChannelData(0);
+          for (let i = 0; i < bufSize; i++) {
+            data[i] = (Math.random() * 2 - 1) * (1 - i / bufSize);
+          }
+          const src = ac.createBufferSource();
+          src.buffer = buf;
+          const g = ac.createGain();
+          g.gain.setValueAtTime(0.08, ac.currentTime);
+          g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.08);
+          const f = ac.createBiquadFilter();
+          f.type = 'highpass';
+          f.frequency.value = 2000;
+          src.connect(f).connect(g).connect(ac.destination);
+          src.start(ac.currentTime);
+        }),
+
+        // ピース配置成功: 「カチッ＋ポワン」
+        place: () => play((ac) => {
+          // カチッ
+          const o1 = ac.createOscillator();
+          const g1 = ac.createGain();
+          o1.type = 'square';
+          o1.frequency.value = 1200;
+          g1.gain.setValueAtTime(0.12, ac.currentTime);
+          g1.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.04);
+          o1.connect(g1).connect(ac.destination);
+          o1.start(ac.currentTime);
+          o1.stop(ac.currentTime + 0.04);
+          // ポワン
+          const o2 = ac.createOscillator();
+          const g2 = ac.createGain();
+          o2.type = 'sine';
+          o2.frequency.setValueAtTime(440, ac.currentTime + 0.03);
+          o2.frequency.exponentialRampToValueAtTime(880, ac.currentTime + 0.15);
+          g2.gain.setValueAtTime(0.001, ac.currentTime);
+          g2.gain.linearRampToValueAtTime(0.15, ac.currentTime + 0.05);
+          g2.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.35);
+          o2.connect(g2).connect(ac.destination);
+          o2.start(ac.currentTime + 0.03);
+          o2.stop(ac.currentTime + 0.35);
+        }),
+
+        // 無効配置: 「ブッ」
+        invalid: () => play((ac) => {
+          const o = ac.createOscillator();
+          const g = ac.createGain();
+          o.type = 'sawtooth';
+          o.frequency.value = 100;
+          g.gain.setValueAtTime(0.12, ac.currentTime);
+          g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.15);
+          o.connect(g).connect(ac.destination);
+          o.start(ac.currentTime);
+          o.stop(ac.currentTime + 0.15);
+        }),
+
+        // ターン開始: 「ティン」
+        turnStart: () => play((ac) => {
+          const o = ac.createOscillator();
+          const g = ac.createGain();
+          o.type = 'sine';
+          o.frequency.setValueAtTime(1047, ac.currentTime);
+          o.frequency.exponentialRampToValueAtTime(1319, ac.currentTime + 0.1);
+          g.gain.setValueAtTime(0.1, ac.currentTime);
+          g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.25);
+          o.connect(g).connect(ac.destination);
+          o.start(ac.currentTime);
+          o.stop(ac.currentTime + 0.25);
+        }),
+
+        // パス: 下降音「ピロ〜」
+        pass: () => play((ac) => {
+          const o = ac.createOscillator();
+          const g = ac.createGain();
+          o.type = 'sine';
+          o.frequency.setValueAtTime(880, ac.currentTime);
+          o.frequency.exponentialRampToValueAtTime(220, ac.currentTime + 0.4);
+          g.gain.setValueAtTime(0.12, ac.currentTime);
+          g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.4);
+          o.connect(g).connect(ac.destination);
+          o.start(ac.currentTime);
+          o.stop(ac.currentTime + 0.4);
+        }),
+
+        // ゲームオーバー: ファンファーレ
+        gameOver: () => play((ac) => {
+          const notes = [523, 659, 784, 1047];
+          notes.forEach((freq, i) => {
+            const o = ac.createOscillator();
+            const g = ac.createGain();
+            o.type = 'sine';
+            o.frequency.value = freq;
+            const t = ac.currentTime + i * 0.15;
+            g.gain.setValueAtTime(0.001, t);
+            g.gain.linearRampToValueAtTime(0.12, t + 0.05);
+            g.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+            o.connect(g).connect(ac.destination);
+            o.start(t);
+            o.stop(t + 0.5);
+          });
+        }),
+      };
+    })();
+
+    // 通常ピース定義（11種類）
+    const NORMAL_PIECES = [
+      [[1]],
+      [[1, 1]],
+      [[1, 1, 1]],
+      [[1, 1], [1, 0]],
+      [[1, 1, 1, 1]],
+      [[1, 1, 1], [1, 0, 0]],
+      [[1, 1, 1], [0, 1, 0]],
+      [[1, 1], [1, 1]],
+      [[1, 1, 1, 1, 1]],
+      [[1, 1, 1, 1], [1, 0, 0, 0]],
+      [[1, 1, 1], [0, 1, 0], [0, 1, 0]],
+    ];
+
+    // 7マスピース候補（ランダムで1つ選ばれる）
+    const SEVEN_PIECE_CANDIDATES = [
+      [[1, 1, 1, 1, 1, 1, 1]],
+      [[1, 1, 1, 1, 1, 1], [1, 0, 0, 0, 0, 0]],
+      [[1, 1, 1, 1, 1], [0, 0, 1, 0, 0], [0, 0, 1, 0, 0]],
+    ];
+
+    const SEVEN_PIECE_START_INDEX = NORMAL_PIECES.length;
+
+    const createPlayerPieces = () => {
+      return [0, 1, 2, 3].map(() => {
+        const randomSevenPiece = SEVEN_PIECE_CANDIDATES[Math.floor(Math.random() * SEVEN_PIECE_CANDIDATES.length)];
+        const allPieces = [...NORMAL_PIECES, randomSevenPiece];
+        return allPieces.map((p, i) => ({ id: i, shape: p, used: false }));
+      });
+    };
+
+    const BOARD_SIZE = 14;
+
+    // 動的セルサイズ計算
+    const calcCellSize = () => {
+      const w = window.innerWidth;
+      if (w <= 430) return 22;
+      const maxBoardWidth = Math.min(w - 40, 700);
+      const size = Math.floor((maxBoardWidth - BOARD_SIZE) / BOARD_SIZE);
+      return Math.min(Math.max(size, 22), 42);
+    };
+
+    const PLAYER_COLORS = {
+      0: '#E53935',
+      1: '#1E88E5',
+      2: '#FDD835',
+      3: '#43A047',
+    };
+
+    const PLAYER_START_COLORS = {
+      0: '#FF6B6B',
+      1: '#4DABF7',
+      2: '#FFE066',
+      3: '#69DB7C',
+    };
+
+    const PLAYER_NAMES = ['赤', '青', '黄', '緑'];
+    const PLAYER_TEAMS = [1, 2, 1, 2];
+
+    const START_CORNERS = [
+      { row: 0, col: 0 },
+      { row: 0, col: BOARD_SIZE - 1 },
+      { row: BOARD_SIZE - 1, col: 0 },
+      { row: BOARD_SIZE - 1, col: BOARD_SIZE - 1 },
+    ];
+
+    const rotatePiece = (piece) => {
+      const rows = piece.length;
+      const cols = piece[0].length;
+      const rotated = Array(cols).fill(null).map(() => Array(rows).fill(0));
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          rotated[c][rows - 1 - r] = piece[r][c];
+        }
+      }
+      return rotated;
+    };
+
+    const flipPiece = (piece) => {
+      return piece.map(row => [...row].reverse());
+    };
+
+    const countPieceCells = (piece) => {
+      return piece.flat().filter(cell => cell === 1).length;
+    };
+
+    function BlokusGame() {
+      const [board, setBoard] = useState(() =>
+        Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(-1))
+      );
+      const [currentPlayer, setCurrentPlayer] = useState(0);
+      const [playerPieces, setPlayerPieces] = useState(() => createPlayerPieces());
+      const [selectedPieceId, setSelectedPieceId] = useState(null);
+      const [currentShape, setCurrentShape] = useState(null);
+      const [previewPos, setPreviewPos] = useState(null);
+      const [passedPlayers, setPassedPlayers] = useState([false, false, false, false]);
+      const [gameOver, setGameOver] = useState(false);
+      const [firstMoves, setFirstMoves] = useState([false, false, false, false]);
+      const [menuOpen, setMenuOpen] = useState(false);
+      const [lastPlacedCells, setLastPlacedCells] = useState([]);
+      const [cellSize, setCellSize] = useState(calcCellSize);
+      const [autoRotate, setAutoRotate] = useState(true);
+      const [muted, setMuted] = useState(false);
+
+      // ピンチズーム state
+      const [zoomScale, setZoomScale] = useState(1);
+      const [zoomOrigin, setZoomOrigin] = useState({ x: 50, y: 50 });
+      const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
+      const boardContainerRef = useRef(null);
+      const pinchRef = useRef({ dist: 0, scale: 1, panning: false, startX: 0, startY: 0, panStartX: 0, panStartY: 0 });
+
+      // 画面リサイズでセルサイズ更新
+      useEffect(() => {
+        const onResize = () => setCellSize(calcCellSize());
+        window.addEventListener('resize', onResize);
+        return () => window.removeEventListener('resize', onResize);
+      }, []);
+
+      // ピンチズーム ハンドラ
+      useEffect(() => {
+        const el = boardContainerRef.current;
+        if (!el) return;
+
+        const getDistance = (t1, t2) => {
+          const dx = t1.clientX - t2.clientX;
+          const dy = t1.clientY - t2.clientY;
+          return Math.sqrt(dx * dx + dy * dy);
+        };
+
+        const onTouchStart = (e) => {
+          if (e.touches.length === 2) {
+            e.preventDefault();
+            pinchRef.current.dist = getDistance(e.touches[0], e.touches[1]);
+            pinchRef.current.scale = zoomScale;
+          } else if (e.touches.length === 1 && zoomScale > 1) {
+            pinchRef.current.panning = true;
+            pinchRef.current.startX = e.touches[0].clientX;
+            pinchRef.current.startY = e.touches[0].clientY;
+            pinchRef.current.panStartX = panOffset.x;
+            pinchRef.current.panStartY = panOffset.y;
+          }
+        };
+
+        const onTouchMove = (e) => {
+          if (e.touches.length === 2) {
+            e.preventDefault();
+            const newDist = getDistance(e.touches[0], e.touches[1]);
+            const ratio = newDist / pinchRef.current.dist;
+            const newScale = Math.max(1, Math.min(3, pinchRef.current.scale * ratio));
+            setZoomScale(newScale);
+
+            const rect = el.getBoundingClientRect();
+            const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+            const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+            const pctX = ((midX - rect.left) / rect.width) * 100;
+            const pctY = ((midY - rect.top) / rect.height) * 100;
+            setZoomOrigin({ x: pctX, y: pctY });
+          } else if (e.touches.length === 1 && pinchRef.current.panning && zoomScale > 1) {
+            const dx = e.touches[0].clientX - pinchRef.current.startX;
+            const dy = e.touches[0].clientY - pinchRef.current.startY;
+            setPanOffset({
+              x: pinchRef.current.panStartX + dx,
+              y: pinchRef.current.panStartY + dy,
+            });
+          }
+        };
+
+        const onTouchEnd = (e) => {
+          pinchRef.current.panning = false;
+          if (e.touches.length < 2) {
+            pinchRef.current.dist = 0;
+          }
+        };
+
+        el.addEventListener('touchstart', onTouchStart, { passive: false });
+        el.addEventListener('touchmove', onTouchMove, { passive: false });
+        el.addEventListener('touchend', onTouchEnd);
+
+        return () => {
+          el.removeEventListener('touchstart', onTouchStart);
+          el.removeEventListener('touchmove', onTouchMove);
+          el.removeEventListener('touchend', onTouchEnd);
+        };
+      }, [zoomScale, panOffset]);
+
+      // ダブルタップでズームリセット
+      const lastTapRef = useRef(0);
+      const handleBoardDoubleCheck = useCallback((e) => {
+        const now = Date.now();
+        if (now - lastTapRef.current < 300) {
+          if (zoomScale !== 1) {
+            setZoomScale(1);
+            setPanOffset({ x: 0, y: 0 });
+            e.preventDefault();
+            return true;
+          }
+        }
+        lastTapRef.current = now;
+        return false;
+      }, [zoomScale]);
+
+      // ボード回転判定
+      const isBoardRotated = autoRotate && (currentPlayer === 1 || currentPlayer === 3);
+
+      const pieceCellSize = Math.max(10, Math.floor(cellSize * 0.5));
+
+      const remainingCells = useMemo(() => {
+        return playerPieces.map(pieces =>
+          pieces.filter(p => !p.used).reduce((sum, p) => sum + countPieceCells(p.shape), 0)
+        );
+      }, [playerPieces]);
+
+      const teamScores = useMemo(() => ({
+        1: remainingCells[0] + remainingCells[2],
+        2: remainingCells[1] + remainingCells[3],
+      }), [remainingCells]);
+
+      const canPlace = useCallback((shape, startRow, startCol, player, boardState, isFirstMove) => {
+        const rows = shape.length;
+        const cols = shape[0].length;
+        let hasCornerConnection = false;
+        let touchesOwnEdge = false;
+        let coversStartCorner = false;
+        const startCorner = START_CORNERS[player];
+
+        for (let r = 0; r < rows; r++) {
+          for (let c = 0; c < cols; c++) {
+            if (shape[r][c] === 1) {
+              const boardRow = startRow + r;
+              const boardCol = startCol + c;
+
+              if (boardRow < 0 || boardRow >= BOARD_SIZE || boardCol < 0 || boardCol >= BOARD_SIZE) {
+                return false;
+              }
+
+              if (boardState[boardRow][boardCol] !== -1) {
+                return false;
+              }
+
+              if (boardRow === startCorner.row && boardCol === startCorner.col) {
+                coversStartCorner = true;
+              }
+
+              const adjacents = [
+                [boardRow - 1, boardCol],
+                [boardRow + 1, boardCol],
+                [boardRow, boardCol - 1],
+                [boardRow, boardCol + 1],
+              ];
+              for (const [ar, ac] of adjacents) {
+                if (ar >= 0 && ar < BOARD_SIZE && ac >= 0 && ac < BOARD_SIZE) {
+                  if (boardState[ar][ac] === player) {
+                    touchesOwnEdge = true;
+                  }
+                }
+              }
+
+              const corners = [
+                [boardRow - 1, boardCol - 1],
+                [boardRow - 1, boardCol + 1],
+                [boardRow + 1, boardCol - 1],
+                [boardRow + 1, boardCol + 1],
+              ];
+              for (const [cr, cc] of corners) {
+                if (cr >= 0 && cr < BOARD_SIZE && cc >= 0 && cc < BOARD_SIZE) {
+                  if (boardState[cr][cc] === player) {
+                    hasCornerConnection = true;
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        if (isFirstMove) {
+          return coversStartCorner && !touchesOwnEdge;
+        }
+
+        return hasCornerConnection && !touchesOwnEdge;
+      }, []);
+
+      const hasValidMove = useCallback((player, boardState, pieces, isFirst) => {
+        const availablePieces = pieces[player].filter(p => !p.used);
+
+        for (const piece of availablePieces) {
+          let shape = piece.shape;
+          for (let rotation = 0; rotation < 4; rotation++) {
+            for (let flip = 0; flip < 2; flip++) {
+              for (let row = -6; row < BOARD_SIZE; row++) {
+                for (let col = -6; col < BOARD_SIZE; col++) {
+                  if (canPlace(shape, row, col, player, boardState, isFirst)) {
+                    return true;
+                  }
+                }
+              }
+              shape = flipPiece(shape);
+            }
+            shape = rotatePiece(shape);
+          }
+        }
+        return false;
+      }, [canPlace]);
+
+      const findNextPlayer = useCallback((currentP, newBoard, newPlayerPieces, newFirstMoves, newPassedPlayers) => {
+        let nextPlayer = (currentP + 1) % 4;
+        let attempts = 0;
+        const updatedPassedPlayers = [...newPassedPlayers];
+        let anyPassed = false;
+
+        while (attempts < 4) {
+          if (updatedPassedPlayers[nextPlayer]) {
+            nextPlayer = (nextPlayer + 1) % 4;
+            attempts++;
+            continue;
+          }
+
+          const isFirst = !newFirstMoves[nextPlayer];
+          if (hasValidMove(nextPlayer, newBoard, newPlayerPieces, isFirst)) {
+            return { nextPlayer, passedPlayers: updatedPassedPlayers, anyPassed };
+          }
+
+          updatedPassedPlayers[nextPlayer] = true;
+          anyPassed = true;
+          nextPlayer = (nextPlayer + 1) % 4;
+          attempts++;
+        }
+
+        return { nextPlayer: -1, passedPlayers: updatedPassedPlayers, anyPassed };
+      }, [hasValidMove]);
+
+      const isPreviewValid = useMemo(() => {
+        if (!currentShape || !previewPos) return false;
+        const isFirstMove = !firstMoves[currentPlayer];
+        return canPlace(currentShape, previewPos.row, previewPos.col, currentPlayer, board, isFirstMove);
+      }, [currentShape, previewPos, firstMoves, currentPlayer, board, canPlace]);
+
+      const confirmPlace = useCallback(() => {
+        if (!previewPos || !currentShape || !isPreviewValid) return;
+
+        const newBoard = board.map(row => [...row]);
+        const rows = currentShape.length;
+        const cols = currentShape[0].length;
+        const placedCells = [];
+
+        for (let r = 0; r < rows; r++) {
+          for (let c = 0; c < cols; c++) {
+            if (currentShape[r][c] === 1) {
+              const boardRow = previewPos.row + r;
+              const boardCol = previewPos.col + c;
+              newBoard[boardRow][boardCol] = currentPlayer;
+              placedCells.push({ row: boardRow, col: boardCol });
+            }
+          }
+        }
+
+        SoundEngine.place();
+        setBoard(newBoard);
+        setLastPlacedCells(placedCells);
+
+        const newPlayerPieces = playerPieces.map((pieces, idx) =>
+          idx === currentPlayer
+            ? pieces.map(p => p.id === selectedPieceId ? { ...p, used: true } : p)
+            : pieces
+        );
+        setPlayerPieces(newPlayerPieces);
+
+        const newFirstMoves = [...firstMoves];
+        if (!firstMoves[currentPlayer]) {
+          newFirstMoves[currentPlayer] = true;
+        }
+        setFirstMoves(newFirstMoves);
+
+        setSelectedPieceId(null);
+        setCurrentShape(null);
+        setPreviewPos(null);
+
+        // ズームリセット
+        setZoomScale(1);
+        setPanOffset({ x: 0, y: 0 });
+
+        const { nextPlayer, passedPlayers: updatedPassedPlayers, anyPassed } = findNextPlayer(
+          currentPlayer, newBoard, newPlayerPieces, newFirstMoves, passedPlayers
+        );
+
+        setPassedPlayers(updatedPassedPlayers);
+
+        if (nextPlayer === -1 || updatedPassedPlayers.every(p => p)) {
+          setGameOver(true);
+          setTimeout(() => SoundEngine.gameOver(), 300);
+        } else {
+          setCurrentPlayer(nextPlayer);
+          if (anyPassed) {
+            setTimeout(() => SoundEngine.pass(), 100);
+          }
+          setTimeout(() => SoundEngine.turnStart(), anyPassed ? 500 : 200);
+        }
+      }, [previewPos, currentShape, isPreviewValid, board, currentPlayer, playerPieces, selectedPieceId, firstMoves, passedPlayers, findNextPlayer]);
+
+      const cancelPreview = useCallback(() => {
+        setPreviewPos(null);
+      }, []);
+
+      const resetGame = () => {
+        setBoard(Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(-1)));
+        setCurrentPlayer(0);
+        setPlayerPieces(createPlayerPieces());
+        setSelectedPieceId(null);
+        setCurrentShape(null);
+        setPreviewPos(null);
+        setPassedPlayers([false, false, false, false]);
+        setGameOver(false);
+        setFirstMoves([false, false, false, false]);
+        setMenuOpen(false);
+        setLastPlacedCells([]);
+        setZoomScale(1);
+        setPanOffset({ x: 0, y: 0 });
+      };
+
+      const selectPiece = (piece) => {
+        if (piece.used) return;
+        SoundEngine.select();
+        setSelectedPieceId(piece.id);
+        setCurrentShape(piece.shape);
+        setPreviewPos(null);
+      };
+
+      const handleBoardTap = (row, col) => {
+        if (!currentShape) return;
+        // 回転中は座標を反転
+        if (isBoardRotated) {
+          row = BOARD_SIZE - 1 - row;
+          col = BOARD_SIZE - 1 - col;
+        }
+        setPreviewPos({ row, col });
+      };
+
+      const handleRotate = (e) => {
+        e.stopPropagation();
+        SoundEngine.rotate();
+        setCurrentShape(rotatePiece(currentShape));
+      };
+
+      const handleFlip = (e) => {
+        e.stopPropagation();
+        SoundEngine.rotate();
+        setCurrentShape(flipPiece(currentShape));
+      };
+
+      const getPreviewCells = useCallback(() => {
+        if (!currentShape || !previewPos) return [];
+        const cells = [];
+        const rows = currentShape.length;
+        const cols = currentShape[0].length;
+
+        for (let r = 0; r < rows; r++) {
+          for (let c = 0; c < cols; c++) {
+            if (currentShape[r][c] === 1) {
+              const boardRow = previewPos.row + r;
+              const boardCol = previewPos.col + c;
+              if (boardRow >= 0 && boardRow < BOARD_SIZE && boardCol >= 0 && boardCol < BOARD_SIZE) {
+                cells.push({ row: boardRow, col: boardCol, valid: isPreviewValid });
+              }
+            }
+          }
+        }
+        return cells;
+      }, [currentShape, previewPos, isPreviewValid]);
+
+      const previewCells = getPreviewCells();
+
+      const currentPlayerPieces = playerPieces[currentPlayer];
+
+      const previewBounds = useMemo(() => {
+        if (previewCells.length === 0) return null;
+        const rows = previewCells.map(c => c.row);
+        const cols = previewCells.map(c => c.col);
+        return {
+          minRow: Math.min(...rows),
+          maxRow: Math.max(...rows),
+          minCol: Math.min(...cols),
+          maxCol: Math.max(...cols),
+        };
+      }, [previewCells]);
+
+      const isLastPlaced = useCallback((row, col) => {
+        return lastPlacedCells.some(cell => cell.row === row && cell.col === col);
+      }, [lastPlacedCells]);
+
+      const toggleMute = () => {
+        const next = !muted;
+        setMuted(next);
+        SoundEngine.setMuted(next);
+      };
+
+      const maxWidth = Math.min(window.innerWidth - 16, 700);
+
+      return (
+        <div style={{
+          minHeight: '100vh',
+          background: 'linear-gradient(180deg, #f8f9fa 0%, #e9ecef 100%)',
+          padding: '12px',
+          fontFamily: '"Noto Sans JP", sans-serif',
+        }}>
+          <div style={{
+            maxWidth: `${maxWidth}px`,
+            margin: '0 auto',
+          }}>
+            {/* ヘッダー */}
+            <div style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginBottom: '12px',
+            }}>
+              <div style={{ width: '40px' }}></div>
+              <h1 style={{
+                fontSize: '28px',
+                fontWeight: 900,
+                background: 'linear-gradient(90deg, #E53935, #1E88E5, #FDD835, #43A047)',
+                WebkitBackgroundClip: 'text',
+                WebkitTextFillColor: 'transparent',
+                margin: 0,
+                letterSpacing: '2px',
+              }}>
+                BLOKUS
+              </h1>
+
+              {/* ハンバーガーメニュー */}
+              <div style={{ position: 'relative' }}>
+                <button
+                  onClick={() => setMenuOpen(!menuOpen)}
+                  style={{
+                    width: '40px',
+                    height: '40px',
+                    background: '#fff',
+                    border: 'none',
+                    borderRadius: '8px',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    justifyContent: 'center',
+                    alignItems: 'center',
+                    gap: '4px',
+                    boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+                  }}
+                >
+                  <span style={{ width: '18px', height: '2px', background: '#333', borderRadius: '1px' }}></span>
+                  <span style={{ width: '18px', height: '2px', background: '#333', borderRadius: '1px' }}></span>
+                  <span style={{ width: '18px', height: '2px', background: '#333', borderRadius: '1px' }}></span>
+                </button>
+
+                {menuOpen && (
+                  <div style={{
+                    position: 'absolute',
+                    top: '48px',
+                    right: '0',
+                    background: '#fff',
+                    borderRadius: '12px',
+                    boxShadow: '0 4px 20px rgba(0,0,0,0.15)',
+                    padding: '8px',
+                    zIndex: 100,
+                    minWidth: '180px',
+                  }}>
+                    <button
+                      onClick={resetGame}
+                      style={{
+                        width: '100%',
+                        padding: '12px 16px',
+                        fontSize: '14px',
+                        fontWeight: 600,
+                        background: '#fff',
+                        color: '#E53935',
+                        border: 'none',
+                        borderRadius: '8px',
+                        cursor: 'pointer',
+                        textAlign: 'left',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                      }}
+                    >
+                      リセット
+                    </button>
+                    <button
+                      onClick={() => { setAutoRotate(!autoRotate); setMenuOpen(false); }}
+                      style={{
+                        width: '100%',
+                        padding: '12px 16px',
+                        fontSize: '14px',
+                        fontWeight: 600,
+                        background: '#fff',
+                        color: autoRotate ? '#1E88E5' : '#999',
+                        border: 'none',
+                        borderRadius: '8px',
+                        cursor: 'pointer',
+                        textAlign: 'left',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                      }}
+                    >
+                      {autoRotate ? '回転ON' : '回転OFF'}
+                      <span style={{
+                        fontSize: '11px',
+                        color: '#999',
+                        fontWeight: 400,
+                      }}>対面モード</span>
+                    </button>
+                    <button
+                      onClick={() => { toggleMute(); setMenuOpen(false); }}
+                      style={{
+                        width: '100%',
+                        padding: '12px 16px',
+                        fontSize: '14px',
+                        fontWeight: 600,
+                        background: '#fff',
+                        color: muted ? '#999' : '#43A047',
+                        border: 'none',
+                        borderRadius: '8px',
+                        cursor: 'pointer',
+                        textAlign: 'left',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                      }}
+                    >
+                      {muted ? 'サウンドOFF' : 'サウンドON'}
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* メニュー外クリックで閉じる */}
+            {menuOpen && (
+              <div
+                onClick={() => setMenuOpen(false)}
+                style={{
+                  position: 'fixed',
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  zIndex: 99,
+                }}
+              />
+            )}
+
+            {/* スコア表示 */}
+            <div style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              marginBottom: '10px',
+              padding: '8px 12px',
+              background: '#fff',
+              borderRadius: '12px',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.08)',
+            }}>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: '11px', color: '#666' }}>チーム1</div>
+                <div style={{ display: 'flex', gap: '4px', justifyContent: 'center', alignItems: 'center' }}>
+                  <span style={{ width: '10px', height: '10px', background: PLAYER_COLORS[0], borderRadius: '2px' }}></span>
+                  <span style={{ width: '10px', height: '10px', background: PLAYER_COLORS[2], borderRadius: '2px' }}></span>
+                  <span style={{ fontSize: '20px', fontWeight: 900, color: '#333', marginLeft: '4px' }}>{teamScores[1]}</span>
+                </div>
+              </div>
+              <div style={{
+                fontSize: '12px',
+                color: '#999',
+                alignSelf: 'center',
+              }}>vs</div>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: '11px', color: '#666' }}>チーム2</div>
+                <div style={{ display: 'flex', gap: '4px', justifyContent: 'center', alignItems: 'center' }}>
+                  <span style={{ width: '10px', height: '10px', background: PLAYER_COLORS[1], borderRadius: '2px' }}></span>
+                  <span style={{ width: '10px', height: '10px', background: PLAYER_COLORS[3], borderRadius: '2px' }}></span>
+                  <span style={{ fontSize: '20px', fontWeight: 900, color: '#333', marginLeft: '4px' }}>{teamScores[2]}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* ゲームオーバー */}
+            {gameOver && (
+              <div style={{
+                background: '#fff',
+                borderRadius: '16px',
+                padding: '20px',
+                marginBottom: '12px',
+                textAlign: 'center',
+                boxShadow: '0 4px 20px rgba(0,0,0,0.15)',
+              }}>
+                <div style={{ fontSize: '24px', marginBottom: '8px' }}>*</div>
+                <div style={{
+                  fontSize: '20px',
+                  fontWeight: 900,
+                  color: teamScores[1] < teamScores[2] ? '#E53935' :
+                         teamScores[2] < teamScores[1] ? '#1E88E5' : '#333',
+                  marginBottom: '16px',
+                }}>
+                  {teamScores[1] < teamScores[2]
+                    ? 'チーム1（赤・黄）の勝利！'
+                    : teamScores[2] < teamScores[1]
+                      ? 'チーム2（青・緑）の勝利！'
+                      : '引き分け！'}
+                </div>
+                <button
+                  onClick={resetGame}
+                  style={{
+                    padding: '12px 32px',
+                    fontSize: '16px',
+                    fontWeight: 700,
+                    background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                    color: '#fff',
+                    border: 'none',
+                    borderRadius: '24px',
+                    cursor: 'pointer',
+                  }}
+                >
+                  もう一度
+                </button>
+              </div>
+            )}
+
+            {/* 全プレイヤーの残りマス表示 */}
+            {!gameOver && (
+              <div style={{
+                display: 'flex',
+                justifyContent: 'center',
+                gap: '12px',
+                marginBottom: '8px',
+                padding: '6px 10px',
+                background: 'rgba(255,255,255,0.7)',
+                borderRadius: '8px',
+                flexWrap: 'wrap',
+              }}>
+                {[0, 1, 2, 3].map(player => (
+                  <div key={player} style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                    opacity: player === currentPlayer ? 1 : 0.5,
+                    fontWeight: player === currentPlayer ? 700 : 400,
+                  }}>
+                    <span style={{
+                      width: '10px',
+                      height: '10px',
+                      background: PLAYER_COLORS[player],
+                      borderRadius: '2px',
+                      boxShadow: player === currentPlayer ? `0 0 6px ${PLAYER_COLORS[player]}` : 'none',
+                    }}></span>
+                    <span style={{ fontSize: '12px', color: '#333' }}>
+                      {remainingCells[player]}
+                    </span>
+                    {player === currentPlayer && (
+                      <span style={{ fontSize: '10px' }}>&#9664;</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* 現在のターン表示 */}
+            {!gameOver && (
+              <div style={{
+                textAlign: 'center',
+                marginBottom: '8px',
+                padding: '8px 16px',
+                background: `${PLAYER_COLORS[currentPlayer]}15`,
+                borderRadius: '10px',
+                border: `2px solid ${PLAYER_COLORS[currentPlayer]}`,
+              }}>
+                <span style={{
+                  color: PLAYER_COLORS[currentPlayer],
+                  fontSize: '16px',
+                  fontWeight: 700,
+                }}>
+                  {PLAYER_NAMES[currentPlayer]}のターン
+                </span>
+                <span style={{
+                  color: '#666',
+                  fontSize: '12px',
+                  marginLeft: '8px',
+                }}>
+                  (チーム{PLAYER_TEAMS[currentPlayer]})
+                </span>
+                {autoRotate && isBoardRotated && (
+                  <span style={{ color: '#999', fontSize: '11px', marginLeft: '8px' }}>
+                    [対面]
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* ゲームボード */}
+            <div style={{ position: 'relative' }}
+              ref={boardContainerRef}
+              onTouchStart={(e) => handleBoardDoubleCheck(e)}
+            >
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: `repeat(${BOARD_SIZE}, ${cellSize}px)`,
+                  gap: '1px',
+                  background: '#ccc',
+                  padding: '2px',
+                  borderRadius: '8px',
+                  boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+                  margin: '0 auto',
+                  width: 'fit-content',
+                  position: 'relative',
+                  transform: `${isBoardRotated ? 'rotate(180deg)' : 'rotate(0deg)'} scale(${zoomScale})`,
+                  transformOrigin: `${zoomOrigin.x}% ${zoomOrigin.y}%`,
+                  transition: 'transform 0.4s ease',
+                  marginLeft: zoomScale > 1 ? `${panOffset.x}px` : undefined,
+                  marginTop: zoomScale > 1 ? `${panOffset.y}px` : undefined,
+                }}
+              >
+                {board.map((row, ri) =>
+                  row.map((cell, ci) => {
+                    const previewCell = previewCells.find(p => p.row === ri && p.col === ci);
+                    const isPreview = !!previewCell;
+                    const isLastPlacedCell = isLastPlaced(ri, ci);
+
+                    const startCornerPlayer = START_CORNERS.findIndex(
+                      corner => corner.row === ri && corner.col === ci
+                    );
+                    const isStartCorner = startCornerPlayer !== -1 && !firstMoves[startCornerPlayer];
+
+                    const invalidStyle = isPreview && !previewCell.valid ? {
+                      background: `repeating-linear-gradient(
+                        45deg,
+                        #FFD600,
+                        #FFD600 4px,
+                        #212121 4px,
+                        #212121 8px
+                      )`,
+                    } : {};
+
+                    return (
+                      <div
+                        key={`${ri}-${ci}`}
+                        onClick={() => handleBoardTap(ri, ci)}
+                        style={{
+                          width: cellSize,
+                          height: cellSize,
+                          background: cell !== -1
+                            ? PLAYER_COLORS[cell]
+                            : isPreview
+                              ? previewCell.valid
+                                ? `${PLAYER_COLORS[currentPlayer]}cc`
+                                : undefined
+                              : isStartCorner
+                                ? PLAYER_START_COLORS[startCornerPlayer]
+                                : '#fafafa',
+                          borderRadius: '3px',
+                          cursor: currentShape ? 'pointer' : 'default',
+                          transition: 'background 0.1s',
+                          boxShadow: cell !== -1
+                            ? isLastPlacedCell
+                              ? undefined
+                              : 'inset 2px 2px 4px rgba(255,255,255,0.4), inset -1px -1px 3px rgba(0,0,0,0.2)'
+                            : isStartCorner && cell === -1
+                              ? `0 0 8px ${PLAYER_START_COLORS[startCornerPlayer]}, inset 0 0 4px rgba(255,255,255,0.5)`
+                              : 'none',
+                          border: isStartCorner && cell === -1
+                            ? `2px solid ${PLAYER_COLORS[startCornerPlayer]}`
+                            : isPreview && previewCell.valid
+                              ? `2px solid ${PLAYER_COLORS[currentPlayer]}`
+                              : 'none',
+                          color: PLAYER_START_COLORS[startCornerPlayer],
+                          animation: isStartCorner && cell === -1
+                            ? 'glowPulse 1.5s ease-in-out infinite'
+                            : isLastPlacedCell
+                              ? 'lastPlacedGlow 1s ease-in-out infinite'
+                              : 'none',
+                          ...invalidStyle,
+                        }}
+                      />
+                    );
+                  })
+                )}
+
+                {/* 盤上の回転・反転ボタン */}
+                {previewPos && currentShape && previewBounds && (
+                  <div style={{
+                    position: 'absolute',
+                    top: `${previewBounds.minRow * (cellSize + 1) - 40}px`,
+                    left: `${(previewBounds.maxCol + 1) * (cellSize + 1) + 6}px`,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '6px',
+                    zIndex: 10,
+                    transform: isBoardRotated ? 'rotate(180deg)' : 'none',
+                  }}>
+                    <button
+                      onClick={handleRotate}
+                      style={{
+                        width: `${Math.max(36, cellSize)}px`,
+                        height: `${Math.max(36, cellSize)}px`,
+                        fontSize: '18px',
+                        background: '#fff',
+                        border: `2px solid ${PLAYER_COLORS[currentPlayer]}`,
+                        borderRadius: '50%',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+                        fontWeight: 'bold',
+                      }}
+                    >
+                      &#8635;
+                    </button>
+                    <button
+                      onClick={handleFlip}
+                      style={{
+                        width: `${Math.max(36, cellSize)}px`,
+                        height: `${Math.max(36, cellSize)}px`,
+                        fontSize: '18px',
+                        background: '#fff',
+                        border: `2px solid ${PLAYER_COLORS[currentPlayer]}`,
+                        borderRadius: '50%',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+                        fontWeight: 'bold',
+                      }}
+                    >
+                      &#8596;
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* ズームリセットヒント */}
+              {zoomScale > 1 && (
+                <div style={{
+                  textAlign: 'center',
+                  marginTop: '4px',
+                  fontSize: '11px',
+                  color: '#999',
+                }}>
+                  ダブルタップでリセット ({Math.round(zoomScale * 100)}%)
+                </div>
+              )}
+
+              {/* 決定・キャンセルボタン */}
+              {previewPos && currentShape && (
+                <div style={{
+                  display: 'flex',
+                  gap: '12px',
+                  justifyContent: 'center',
+                  marginTop: '12px',
+                  animation: 'slideUp 0.2s ease-out',
+                }}>
+                  <button
+                    onClick={cancelPreview}
+                    style={{
+                      padding: '14px 28px',
+                      fontSize: '16px',
+                      fontWeight: 700,
+                      background: '#f1f3f4',
+                      color: '#666',
+                      border: 'none',
+                      borderRadius: '24px',
+                      cursor: 'pointer',
+                      boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+                    }}
+                  >
+                    キャンセル
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (isPreviewValid) {
+                        confirmPlace();
+                      } else {
+                        SoundEngine.invalid();
+                      }
+                    }}
+                    disabled={!isPreviewValid}
+                    style={{
+                      padding: '14px 36px',
+                      fontSize: '16px',
+                      fontWeight: 700,
+                      background: isPreviewValid
+                        ? `linear-gradient(135deg, ${PLAYER_COLORS[currentPlayer]}, ${PLAYER_COLORS[currentPlayer]}cc)`
+                        : '#ccc',
+                      color: '#fff',
+                      border: 'none',
+                      borderRadius: '24px',
+                      cursor: isPreviewValid ? 'pointer' : 'not-allowed',
+                      boxShadow: isPreviewValid ? '0 4px 12px rgba(0,0,0,0.2)' : 'none',
+                    }}
+                  >
+                    決定
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* 自分のピース選択エリア（下部） */}
+            {!gameOver && (
+              <div style={{
+                marginTop: '12px',
+                padding: '12px',
+                background: '#fff',
+                borderRadius: '16px',
+                boxShadow: '0 2px 12px rgba(0,0,0,0.08)',
+                border: `2px solid ${PLAYER_COLORS[currentPlayer]}30`,
+              }}>
+                <div style={{
+                  display: 'flex',
+                  justifyContent: 'center',
+                  alignItems: 'center',
+                  marginBottom: '10px',
+                  gap: '6px',
+                }}>
+                  <span style={{
+                    width: '14px',
+                    height: '14px',
+                    background: PLAYER_COLORS[currentPlayer],
+                    borderRadius: '3px',
+                  }}></span>
+                  <span style={{ fontSize: '14px', fontWeight: 700, color: '#333' }}>
+                    {PLAYER_NAMES[currentPlayer]}のピース
+                  </span>
+                </div>
+
+                <div style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: '8px',
+                  justifyContent: 'center',
+                }}>
+                  {currentPlayerPieces.filter(p => {
+                    if (p.used) return false;
+                    if (p.id >= SEVEN_PIECE_START_INDEX && !firstMoves[currentPlayer]) {
+                      return false;
+                    }
+                    return true;
+                  }).map(piece => {
+                    const isSelected = selectedPieceId === piece.id;
+                    const displayShape = isSelected && currentShape ? currentShape : piece.shape;
+
+                    return (
+                      <div
+                        key={piece.id}
+                        style={{
+                          position: 'relative',
+                          padding: '8px',
+                          background: isSelected ? `${PLAYER_COLORS[currentPlayer]}20` : '#f8f9fa',
+                          borderRadius: '8px',
+                          border: isSelected ? `2px solid ${PLAYER_COLORS[currentPlayer]}` : '2px solid transparent',
+                          cursor: 'pointer',
+                          transition: 'all 0.15s',
+                          animation: isSelected ? 'bounce 0.8s infinite' : 'none',
+                        }}
+                        onClick={() => selectPiece(piece)}
+                      >
+                        {isSelected && (
+                          <div style={{
+                            position: 'absolute',
+                            top: '-10px',
+                            right: '-10px',
+                            display: 'flex',
+                            gap: '3px',
+                          }}>
+                            <button
+                              onClick={handleRotate}
+                              style={{
+                                width: '28px',
+                                height: '28px',
+                                fontSize: '14px',
+                                background: '#fff',
+                                border: '1px solid #ddd',
+                                borderRadius: '50%',
+                                cursor: 'pointer',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                boxShadow: '0 1px 4px rgba(0,0,0,0.15)',
+                              }}
+                            >
+                              &#8635;
+                            </button>
+                            <button
+                              onClick={handleFlip}
+                              style={{
+                                width: '28px',
+                                height: '28px',
+                                fontSize: '14px',
+                                background: '#fff',
+                                border: '1px solid #ddd',
+                                borderRadius: '50%',
+                                cursor: 'pointer',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                boxShadow: '0 1px 4px rgba(0,0,0,0.15)',
+                              }}
+                            >
+                              &#8596;
+                            </button>
+                          </div>
+                        )}
+
+                        {displayShape.map((row, ri) => (
+                          <div key={ri} style={{ display: 'flex' }}>
+                            {row.map((cell, ci) => (
+                              <div
+                                key={ci}
+                                style={{
+                                  width: `${pieceCellSize}px`,
+                                  height: `${pieceCellSize}px`,
+                                  background: cell ? PLAYER_COLORS[currentPlayer] : 'transparent',
+                                  borderRadius: '2px',
+                                  margin: '1px',
+                                  boxShadow: cell ? 'inset 1px 1px 2px rgba(255,255,255,0.4)' : 'none',
+                                }}
+                              />
+                            ))}
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* ルール説明 */}
+            <div style={{
+              marginTop: '12px',
+              padding: '10px',
+              background: 'rgba(255,255,255,0.8)',
+              borderRadius: '10px',
+              color: '#666',
+              fontSize: '11px',
+              textAlign: 'center',
+              lineHeight: 1.5,
+            }}>
+              ピースを選択 &#8594; &#8635;&#8596;で調整 &#8594; ボードをタップ &#8594; 決定<br/>
+              最初は角から、以降は角同士で接続（辺はNG）<br/>
+              ピンチで拡大 / ダブルタップでリセット
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<BlokusGame />);
+  </script>
+</body>
+</html>
